@@ -1,0 +1,13 @@
+{
+  "_comment": "Rename this file to workspace_config.json. Keys are class IDs (strings), values are class names. The C key in the tool uses this list when changing a box's class; the N key uses it when assigning a class to a newly drawn box. If this file is absent, the tool auto-builds the top-21 classes from your CSV by frequency on first run and writes them here.",
+  "classes": {
+    "0": "person",
+    "1": "car",
+    "2": "truck",
+    "3": "bicycle",
+    "4": "motorcycle",
+    "5": "bus",
+    "6": "traffic_light",
+    "7": "stop_sign"
+  }
+}

@@ -65,26 +65,132 @@ The tool currently expects a CSV with at least these columns:
 
 ## Install
 
+### 1. Prerequisites
+
+- **Python 3.8 or newer.** Check with:
+
+  ```bash
+  python --version
+  ```
+
+  If Python is not installed, get it from [python.org](https://www.python.org/downloads/).
+  On Windows, make sure to tick **"Add python.exe to PATH"** in the installer.
+- **A desktop OpenCV build.** The tool opens a native window via
+  `cv2.imshow`, so headless servers (no display) are not supported.
+
+### 2. Clone the repo
+
+```bash
+git clone https://github.com/AlpcanCepikk/vision-label-curator.git
+cd vision-label-curator
+```
+
+(If you don't have git, you can also download the ZIP from the GitHub page
+and extract it.)
+
+### 3. (Recommended) Create a virtual environment
+
+Keeps the tool's dependencies isolated from your system Python:
+
+```bash
+# Windows (PowerShell)
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# macOS / Linux
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### 4. Install dependencies
+
 ```bash
 pip install -r requirements.txt
 ```
 
-Requires Python 3.8+ and a desktop OpenCV build (the GUI uses `cv2.imshow`).
+This installs `opencv-python`, `numpy`, and `pandas`.
+
+### 5. Place your dataset next to `review.py`
+
+Until the upcoming CLI-args refactor (see roadmap), the tool resolves
+`images/` and `labels.csv` **relative to its own location**. The simplest
+setup is to copy `review.py` (and optionally `workspace_config.example.json`)
+into your dataset folder:
+
+```
+your_workspace/
+├── images/              # your images
+├── labels.csv           # your label rows
+└── review.py            # copied from this repo
+```
+
+Alternatively, you can leave `review.py` where it is and run it with the
+working directory set to your dataset folder — but the **`images/` and
+`labels.csv` paths are read relative to `review.py`'s own folder**, so
+running it from elsewhere will not work yet.
+
+### 6. (Optional) Pre-define your class list
+
+If you already know the class set you want, copy
+`workspace_config.example.json` to `workspace_config.json` next to
+`review.py` and edit the `classes` map. Otherwise the tool will build one
+automatically from the most-frequent labels in your CSV on first run.
 
 ## Run
 
-From your workspace directory (the one that contains `images/` and
-`labels.csv`):
-
 ```bash
-python /path/to/vision-label-curator/review.py
+python review.py
 ```
 
-Currently the tool resolves `images/` and `labels.csv` relative to its own
-location. **Until the upcoming CLI-args refactor (see roadmap)**, the simplest
-way to use it is to drop `review.py` next to your data, or symlink it.
+A native window opens with the first frame; press `H` any time for an
+in-app help overlay. Press `Q` to save and exit — the next run resumes from
+the same frame index.
 
 ---
+
+## Getting started
+
+A typical first session looks like this:
+
+1. **Lay out your data** as shown in [Expected data layout](#expected-data-layout):
+   put all images in `images/` and your label rows in `labels.csv` (YOLO-normalized
+   `cx, cy, w, h`). Drop `review.py` next to them.
+2. **Install dependencies** with `pip install -r requirements.txt`.
+3. **Run** `python review.py`. On the very first run, the tool:
+   - scans `images/` and drops any CSV rows that point to missing images;
+   - builds a class id ↔ name map from the top 21 most-frequent `class_name`
+     values in your CSV, and writes it to `workspace_config.json` so the
+     mapping stays stable across runs. Edit that file by hand if you want
+     a different ordering or set of classes.
+4. **Review frames one by one.** For each image:
+   - press `D` (or `→`) to go to the next frame without changing anything;
+   - press `SPACE` to mark the current frame as reviewed and advance;
+   - press `T` to trash the whole frame — the image moves to `_Trash/` and
+     all rows for that filename are removed from the CSV in memory;
+   - click a box on the image (or its row in the right-side panel) to select
+     it, then press `E` to drag its corners/edges, `X` to delete it, or
+     `C` to change its class;
+   - press `N` to draw a brand-new box: drag a rectangle, then pick the class
+     by typing the class id;
+   - press `U` to flag the frame as a satellite/aerial shot (metadata only;
+     does not affect labels).
+5. **Save and quit** with `Q` (or press `S` to save mid-session). The CSV is
+   also auto-saved every `AUTOSAVE_EVERY` trashes (default `50`).
+6. **Resume any time.** Progress is stored in `_review_progress.json`; the
+   next run picks up at the same frame index.
+
+### Tips
+
+- Use `F` to jump straight to the next frame that has not been reviewed yet —
+  much faster than walking through reviewed frames one at a time.
+- Use `Z` immediately after `T` to undo a wrong trash; the image is moved back
+  out of `_Trash/` and the rows are restored.
+- If many small boxes overlap, the **right-side box list panel** is faster
+  than clicking on the image — each row shows the box index and class, and
+  clicking it selects that box.
+- `is_satellite` is just a column on each row. After a session, you can split
+  the dataset by filtering `labels.csv` with pandas:
+  `df[df["is_satellite"] == 1]["new_filename"].unique()`.
 
 ## Controls
 

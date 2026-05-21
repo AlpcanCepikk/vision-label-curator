@@ -23,36 +23,36 @@ def imread_unicode(path):
 
 
 # ============================================================
-# _merged REVIEW TOOL  (clean_review.py + review_labels.py birlesimi)
+# vision-label-curator — bbox review & curation tool
 # ============================================================
-# CSV semasi: new_filename, dataset_source, original_filename,
-#             class_name, cx, cy, w, h, img_width, img_height,
-#             status, notes  (bbox YOLO normalize cxcywh)
-# Reviewed bilgisi opsiyonel; calistiginda 'reviewed' kolonu eklenir.
+# Expected CSV columns: new_filename, class_name, cx, cy, w, h
+# (boxes in YOLO-normalized cxcywh in [0, 1]).
+# 'reviewed' and 'is_satellite' columns are created if missing.
 #
-# Kontroller:
-#   D / SAG OK          : Sonraki frame
-#   A / SOL OK          : Onceki frame
-#   SPACE               : Onayla + sonraki
-#   T                   : Frame'i TRASH (gorsel + tum CSV satirlari)
-#   Click               : Box sec
-#   X                   : Secili box'i sil
-#   R                   : Frame'in tum box'larini sil
-#   N                   : Yeni box CIZ modu (mouse drag)
-#   E                   : Secili box EDIT modu (kose/kenar surukle, orta=tasi)
-#   C                   : Secili box'in sinifini degistir
-#   TAB                 : Box secim dongusu
-#   F                   : Sonraki onaylanmamis frame'e atla
-#   Z                   : Son trash'i geri al
-#   S                   : Kaydet
-#   Q                   : Kaydet ve cik
-#   H                   : Yardim
+# Controls:
+#   D / Right Arrow     : next frame
+#   A / Left Arrow      : previous frame
+#   SPACE               : mark reviewed + next
+#   T                   : trash frame (image + all CSV rows)
+#   Click               : select box (image or right-side list panel)
+#   X                   : delete selected box
+#   R                   : remove every box in this frame
+#   N                   : draw new box (mouse drag)
+#   E                   : edit selected box (corners / edges / move)
+#   C                   : change class of selected box
+#   TAB                 : cycle box selection
+#   F                   : jump to next unreviewed frame
+#   U                   : toggle is_satellite flag for this frame
+#   Z                   : undo last trash
+#   S                   : save
+#   Q                   : save and quit
+#   H                   : help overlay
 #
-# Box ciz/sinif degistir sonrasi sinif secimi:
-#   0-9     : Sinif 0-9 direkt
-#   1+0-9   : Sinif 10-19
-#   2+0     : Sinif 20
-#   ESC     : Iptal
+# After drawing a new box or pressing C:
+#   0-9     : pick class 0-9 directly
+#   1+0-9   : pick class 10-19
+#   2+0     : pick class 20
+#   ESC     : cancel
 # ============================================================
 
 WORKSPACE = os.path.dirname(os.path.abspath(__file__))
@@ -62,8 +62,25 @@ CSV_PATH = os.path.join(WORKSPACE, "labels.csv")
 PROGRESS_FILE = os.path.join(WORKSPACE, "_review_progress.json")
 CONFIG_PATH = os.path.join(WORKSPACE, "workspace_config.json")
 
-DISPLAY_W = 1280
-DISPLAY_H = 720
+
+def _detect_display_size(min_w=1280, min_h=720, max_w=1920, max_h=1080, ratio=0.85):
+    """Return (w, h) sized to the user's screen, clamped to sensible bounds.
+    Falls back to (min_w, min_h) on systems without a display query."""
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        root.destroy()
+        w = max(min_w, min(int(sw * ratio), max_w))
+        h = max(min_h, min(int(sh * ratio), max_h))
+        return w, h
+    except Exception:
+        return min_w, min_h
+
+
+DISPLAY_W, DISPLAY_H = _detect_display_size()
 AUTOSAVE_EVERY = 50
 
 CLASS_COLORS = {
@@ -85,19 +102,19 @@ def name_color(name):
 
 
 def build_classes(df):
-    """workspace_config.json varsa onu kullan; yoksa CSV'den top-21 frekans."""
+    """Load class id->name map from workspace_config.json, or build the top-21
+    most-frequent class names from the CSV on first run and persist them."""
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             classes = {int(k): v for k, v in cfg.get("classes", {}).items()}
             if classes:
-                print("[Config] " + str(len(classes)) + " sinif yuklendi: " +
+                print("[Config] Loaded " + str(len(classes)) + " classes: " +
                       str(list(classes.values())))
                 return classes
         except Exception as e:
-            print("workspace_config.json okunamadi: " + str(e))
-    # CSV'den frekans (ilk kez) ve diske kaydet -> sonraki calistirmalarda sabit kalsin
+            print("Could not read workspace_config.json: " + str(e))
     if "class_name" in df.columns:
         vc = df["class_name"].dropna().astype(str)
         vc = vc[vc.str.strip() != ""]
@@ -105,11 +122,12 @@ def build_classes(df):
         classes = {i: name for i, name in enumerate(top.index.tolist())}
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump({"classes": {str(k): v for k, v in classes.items()}}, f, ensure_ascii=False, indent=2)
-            print("[Auto] CSV'den top-" + str(len(classes)) +
-                  " sinif olusturuldu ve kaydedildi: " + CONFIG_PATH)
+                json.dump({"classes": {str(k): v for k, v in classes.items()}},
+                          f, ensure_ascii=False, indent=2)
+            print("[Auto] Built top-" + str(len(classes)) +
+                  " classes from CSV and wrote " + CONFIG_PATH)
         except Exception as e:
-            print("workspace_config.json yazilamadi: " + str(e))
+            print("Could not write workspace_config.json: " + str(e))
         print("[Classes] " + str(list(classes.values())))
         return classes
     return {}
@@ -119,36 +137,34 @@ class Reviewer:
     def __init__(self):
         os.makedirs(TRASH_DIR, exist_ok=True)
         if not os.path.exists(CSV_PATH):
-            print("HATA: " + CSV_PATH + " bulunamadi"); sys.exit(1)
+            print("ERROR: " + CSV_PATH + " not found"); sys.exit(1)
         if not os.path.isdir(IMAGES_DIR):
-            print("HATA: " + IMAGES_DIR + " bulunamadi"); sys.exit(1)
+            print("ERROR: " + IMAGES_DIR + " not found"); sys.exit(1)
 
-        print("CSV yukleniyor (1M+ satir biraz surebilir)...")
+        print("Loading CSV (large files may take a moment)...")
         self.df = pd.read_csv(CSV_PATH)
-        print("  " + str(len(self.df)) + " satir")
+        print("  " + str(len(self.df)) + " rows")
         if "reviewed" not in self.df.columns:
             self.df["reviewed"] = False
-        # NaN reviewed -> False
         self.df["reviewed"] = self.df["reviewed"].fillna(False).astype(bool)
         if "is_satellite" not in self.df.columns:
             self.df["is_satellite"] = 0
         self.df["is_satellite"] = self.df["is_satellite"].fillna(0).astype(int)
 
-        print("Image listesi taraniyor...")
+        print("Scanning images folder...")
         files = sorted([f for f in os.listdir(IMAGES_DIR)
                         if f.lower().endswith((".png", ".jpg", ".jpeg"))])
         self.frames = files
-        print("  " + str(len(self.frames)) + " gorsel")
+        print("  " + str(len(self.frames)) + " images")
 
         existing = set(self.frames)
         before = len(self.df)
         self.df = self.df[self.df["new_filename"].isin(existing)].reset_index(drop=True)
         if len(self.df) < before:
-            print("  " + str(before - len(self.df)) + " orphan satir temizlendi")
+            print("  Removed " + str(before - len(self.df)) + " orphan rows")
             self.df.to_csv(CSV_PATH, index=False)
 
         self.CLASSES = build_classes(self.df)
-        # Sinif adi -> id ters mapping (mevcut box'larin id'sini bulmak icin)
         self.NAME_TO_ID = {v: k for k, v in self.CLASSES.items()}
 
         # State
@@ -162,15 +178,16 @@ class Reviewer:
         self.session_passed = 0
         self.session_satellite = 0
         self.session_satellite_frames = set()
-        self.box_list_rects = []  # [(y1, y2, box_index), ...] display coords
-        self.box_list_panel_rect = None  # (x1, y1, x2, y2) display coords
+        self.box_list_rects = []
+        self.box_list_panel_rect = None
+        self.dirty = True
 
-        # Edit/draw
+        # Edit / draw
         self.draw_mode = False
         self.drawing = False
         self.draw_start = None
         self.draw_end = None
-        self.pending_box = None  # (x1,y1,x2,y2) pixel — sinif bekliyor
+        self.pending_box = None
         self.class_select_mode = False
         self.first_digit = None
         self.edit_mode = False
@@ -186,7 +203,7 @@ class Reviewer:
         self.orig_h = 0
 
         self.load_progress()
-        print("[" + str(self.current_idx + 1) + "/" + str(len(self.frames)) + "] basliyor")
+        print("[" + str(self.current_idx + 1) + "/" + str(len(self.frames)) + "] starting")
 
     # ---------- progress ----------
     def load_progress(self):
@@ -209,7 +226,7 @@ class Reviewer:
         self.save_progress()
         self.unsaved = False
         self.trash_since_save = 0
-        print("  Kaydedildi: " + str(len(self.df)) + " satir")
+        print("  Saved: " + str(len(self.df)) + " rows")
 
     # ---------- helpers ----------
     def get_boxes(self, frame_name):
@@ -271,7 +288,6 @@ class Reviewer:
         return None
 
     def df_index_of_selected(self):
-        """Selected box -> df index."""
         frame = self.frames[self.current_idx]
         mask = self.df["new_filename"] == frame
         idxs = self.df[mask].index.tolist()
@@ -304,7 +320,6 @@ class Reviewer:
         elif handle == "move": x1 += dx; y1 += dy; x2 += dx; y2 += dy
         if x2 - x1 < 5 or y2 - y1 < 5:
             return
-        # Clamp to image
         x1 = max(0, min(iw, x1)); x2 = max(0, min(iw, x2))
         y1 = max(0, min(ih, y1)); y2 = max(0, min(ih, y2))
         if x2 <= x1 or y2 <= y1:
@@ -321,13 +336,14 @@ class Reviewer:
 
     # ---------- mouse ----------
     def mouse_cb(self, event, x, y, flags, param):
-        # Box list paneline click — seçim
+        # Box list panel click -> select
         if event == cv2.EVENT_LBUTTONDOWN and self.box_list_panel_rect is not None:
             px1, py1, px2, py2 = self.box_list_panel_rect
             if px1 <= x <= px2 and py1 <= y <= py2:
                 for y_top, y_bot, bidx in self.box_list_rects:
                     if y_top <= y <= y_bot:
                         self.selected_box = bidx
+                        self.dirty = True
                         return
                 return
 
@@ -361,6 +377,7 @@ class Reviewer:
                 dy = oy - self.edit_drag_start[1]
                 self.apply_edit(self.edit_handle, dx, dy)
                 self.edit_drag_start = (ox, oy)
+                self.dirty = True
             elif event == cv2.EVENT_LBUTTONUP and self.edit_dragging:
                 self.edit_dragging = False
                 self.edit_handle = None
@@ -374,6 +391,7 @@ class Reviewer:
                 self.draw_end = (ox, oy)
             elif event == cv2.EVENT_MOUSEMOVE and self.drawing:
                 self.draw_end = (ox, oy)
+                self.dirty = True
             elif event == cv2.EVENT_LBUTTONUP and self.drawing:
                 self.drawing = False
                 self.draw_end = (ox, oy)
@@ -388,12 +406,14 @@ class Reviewer:
                 else:
                     self.draw_start = None
                     self.draw_end = None
+                self.dirty = True
             return
 
         if event == cv2.EVENT_LBUTTONDOWN:
             frame = self.frames[self.current_idx]
             boxes_df, _ = self.get_boxes(frame)
             self.selected_box = self.find_box_at(ox, oy, boxes_df)
+            self.dirty = True
 
     # ---------- pending box / class ----------
     def add_pending_box(self, class_id):
@@ -401,7 +421,6 @@ class Reviewer:
             return
         bx1, by1, bx2, by2 = self.pending_box
         frame = self.frames[self.current_idx]
-        # img boyutunu al
         iw, ih = self.orig_w, self.orig_h
         if iw <= 0 or ih <= 0:
             self.cancel_pending(); return
@@ -422,7 +441,6 @@ class Reviewer:
             "notes": "manual_review",
             "reviewed": True,
         }
-        # Eksik kolonlari NaN birak
         for col in self.df.columns:
             if col not in new_row:
                 new_row[col] = np.nan
@@ -433,7 +451,7 @@ class Reviewer:
         self.first_digit = None
         self.draw_start = None
         self.draw_end = None
-        print("  Box eklendi: " + cname)
+        print("  Box added: " + cname)
 
     def cancel_pending(self):
         self.pending_box = None
@@ -449,7 +467,7 @@ class Reviewer:
         frame = self.frames[self.current_idx]
         mask = self.df["new_filename"] == frame
         if not mask.any():
-            print("  Uydu: bu frame icin satir yok")
+            print("  Satellite: no rows for this frame")
             return
         current = int(self.df.loc[mask, "is_satellite"].iloc[0]) if mask.any() else 0
         new_val = 0 if current == 1 else 1
@@ -458,12 +476,12 @@ class Reviewer:
             if frame not in self.session_satellite_frames:
                 self.session_satellite_frames.add(frame)
                 self.session_satellite += 1
-            print("  UYDU isaretlendi: " + frame)
+            print("  SATELLITE flagged: " + frame)
         else:
             if frame in self.session_satellite_frames:
                 self.session_satellite_frames.discard(frame)
                 self.session_satellite = max(0, self.session_satellite - 1)
-            print("  Uydu kaldirildi: " + frame)
+            print("  Satellite cleared: " + frame)
         self.unsaved = True
 
     def trash_frame(self):
@@ -479,7 +497,7 @@ class Reviewer:
             try:
                 shutil.move(path, trash_path)
             except Exception as e:
-                print("  Tasima hatasi: " + str(e))
+                print("  Move error: " + str(e))
                 self.df = pd.concat([self.df, saved_rows], ignore_index=True)
                 return
         self.undo_stack.append((frame, trash_path, path, saved_rows, self.current_idx))
@@ -497,13 +515,13 @@ class Reviewer:
 
     def undo(self):
         if not self.undo_stack:
-            print("  Geri alinacak yok"); return
+            print("  Nothing to undo"); return
         frame, trash_path, orig_path, saved_rows, _ = self.undo_stack.pop()
         if os.path.exists(trash_path):
             try:
                 shutil.move(trash_path, orig_path)
             except Exception as e:
-                print("  Undo hatasi: " + str(e)); return
+                print("  Undo error: " + str(e)); return
         self.df = pd.concat([self.df, saved_rows], ignore_index=True)
         self.frames.append(frame); self.frames.sort()
         self.current_idx = self.frames.index(frame)
@@ -518,7 +536,7 @@ class Reviewer:
         self.df = self.df.drop(idx).reset_index(drop=True)
         self.selected_box = -1
         self.unsaved = True
-        print("  Box silindi")
+        print("  Box deleted")
 
     def clear_frame_boxes(self):
         frame = self.frames[self.current_idx]
@@ -529,7 +547,7 @@ class Reviewer:
         self.df = self.df[~mask].reset_index(drop=True)
         self.selected_box = -1
         self.unsaved = True
-        print("  Frame box'lari temizlendi (-" + str(n) + ")")
+        print("  Cleared frame boxes (-" + str(n) + ")")
 
     def jump_unreviewed(self):
         for i in range(self.current_idx + 1, len(self.frames)):
@@ -540,7 +558,7 @@ class Reviewer:
                 self.current_idx = i
                 self.selected_box = -1
                 return
-        print("  Onaylanmamis frame bulunamadi")
+        print("  No unreviewed frame ahead")
 
     def mark_reviewed_and_next(self):
         frame = self.frames[self.current_idx]
@@ -557,10 +575,10 @@ class Reviewer:
         self.selected_box = -1
 
     def change_selected_class(self):
-        """Secili box'in sinifini degistirmek icin: pending'e kopyala, sil, class_select."""
+        """Copy selected box into pending, delete it, enter class-select mode."""
         idx = self.df_index_of_selected()
         if idx is None:
-            print("  Once box sec"); return
+            print("  Select a box first"); return
         try:
             cx = float(self.df.at[idx, "cx"]); cy = float(self.df.at[idx, "cy"])
             w = float(self.df.at[idx, "w"]); h = float(self.df.at[idx, "h"])
@@ -592,8 +610,8 @@ class Reviewer:
         img = imread_unicode(path)
         if img is None:
             img = 64 * np.ones((480, 640, 3), dtype="uint8")
-            cv2.putText(img, "Yuklenemedi", (20, 240),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(img, "Image failed to load", (20, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
         self.orig_h, self.orig_w = img.shape[:2]
         boxes_df, _ = self.get_boxes(frame)
 
@@ -620,7 +638,7 @@ class Reviewer:
             ts = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
             cv2.rectangle(img, (x1, y1 - ts[1] - 6), (x1 + ts[0] + 4, y1), color, -1)
             cv2.putText(img, label, (x1 + 2, y1 - 3),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
             if self.edit_mode and i == self.selected_box:
                 hs = 6
                 ccx, ccy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -637,50 +655,50 @@ class Reviewer:
             bx1, by1, bx2, by2 = self.pending_box
             cv2.rectangle(img, (int(bx1), int(by1)), (int(bx2), int(by2)), (0, 255, 0), 3)
 
-        # Olcekleme + canvas
         sx = DISPLAY_W / max(1, self.orig_w)
         sy = DISPLAY_H / max(1, self.orig_h)
         scale = min(sx, sy)
         self.scale = scale
         new_w = int(self.orig_w * scale); new_h = int(self.orig_h * scale)
-        disp = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        disp = cv2.resize(img, (new_w, new_h), interpolation=interp)
         canvas = np.zeros((DISPLAY_H, DISPLAY_W, 3), dtype="uint8")
         self.x_offset = (DISPLAY_W - new_w) // 2
         self.y_offset = (DISPLAY_H - new_h) // 2
         canvas[self.y_offset:self.y_offset + new_h,
                self.x_offset:self.x_offset + new_w] = disp
 
-        # Ust bar
+        # Top bar
         cv2.rectangle(canvas, (0, 0), (DISPLAY_W, 50), (30, 30, 30), -1)
         is_reviewed = bool(boxes_df["reviewed"].any()) if len(boxes_df) > 0 else False
         is_sat = bool((boxes_df["is_satellite"] == 1).any()) if len(boxes_df) > 0 else False
-        status = "ONAYLANDI" if is_reviewed else "BEKLIYOR"
+        status = "REVIEWED" if is_reviewed else "PENDING"
         scol = (0, 255, 0) if is_reviewed else (0, 200, 255)
         info = ("[" + str(self.current_idx + 1) + "/" + str(len(self.frames)) + "] " +
                 frame + "  Box:" + str(len(boxes_df)) +
-                "  Sec:" + (str(self.selected_box + 1) if self.selected_box >= 0 else "-") +
+                "  Sel:" + (str(self.selected_box + 1) if self.selected_box >= 0 else "-") +
                 "  " + status +
-                ("  UYDU" if is_sat else "") +
+                ("  SAT" if is_sat else "") +
                 "  Pass:" + str(self.session_passed) +
                 "  Trash:" + str(self.session_trashed) +
-                "  Uydu:" + str(self.session_satellite) +
-                ("  KAYDEDILMEMIS" if self.unsaved else ""))
-        cv2.putText(canvas, info, (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.5, scol, 1)
+                "  Sat:" + str(self.session_satellite) +
+                ("  UNSAVED" if self.unsaved else ""))
+        cv2.putText(canvas, info, (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.5, scol, 1, cv2.LINE_AA)
 
-        # Mod bar
+        # Mode bar
         cv2.rectangle(canvas, (0, DISPLAY_H - 30), (DISPLAY_W, DISPLAY_H), (30, 30, 30), -1)
         if self.class_select_mode:
-            mode = "SINIF SEC: 0-9 direkt, 1+0-9=10-19, 2+0=20, ESC=iptal"
+            mode = "PICK CLASS: 0-9 direct, 1+0-9=10-19, 2+0=20, ESC=cancel"
             if self.first_digit is not None:
-                mode = str(self.first_digit) + "_  ikinci rakam veya ESC"
+                mode = str(self.first_digit) + "_  second digit or ESC"
         elif self.edit_mode:
-            mode = "EDIT MOD: kose/kenar surukle, orta=tasi, ESC=cik"
+            mode = "EDIT MODE: drag corners/edges, center=move, ESC=exit"
         elif self.draw_mode:
-            mode = "CIZIM MOD: mouse drag, ESC=cik"
+            mode = "DRAW MODE: mouse drag, ESC=exit"
         else:
-            mode = "D:next A:prev SPACE:onayla T:trash N:ciz E:edit C:sinif TAB:dongu X:box-sil R:temizle F:onaysiz Z:undo S:save Q:cik H:yardim"
+            mode = "D:next A:prev SPACE:review T:trash N:draw E:edit C:class TAB:cycle X:del R:clear F:unreviewed U:satellite Z:undo S:save Q:quit H:help"
         cv2.putText(canvas, mode, (10, DISPLAY_H - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
 
         if self.class_select_mode:
             self.draw_class_panel(canvas)
@@ -707,8 +725,8 @@ class Reviewer:
         cv2.rectangle(overlay, (px, py), (px + panel_w, py + panel_h), (20, 20, 20), -1)
         cv2.addWeighted(overlay, 0.88, canvas, 0.12, 0, canvas)
         cv2.rectangle(canvas, (px, py), (px + panel_w, py + panel_h), (80, 200, 255), 1)
-        cv2.putText(canvas, "BOX'LAR (" + str(len(boxes_df)) + ")", (px + 10, py + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+        cv2.putText(canvas, "BOXES (" + str(len(boxes_df)) + ")", (px + 10, py + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA)
         self.box_list_panel_rect = (px, py, px + panel_w, py + panel_h)
         for i, (_, row) in enumerate(boxes_df.iterrows()):
             if i >= max_rows:
@@ -724,7 +742,7 @@ class Reviewer:
             cv2.rectangle(canvas, (px + 10, y_top + 4), (px + 24, y_bot - 4), color, -1)
             text = str(i + 1) + ": " + cname
             cv2.putText(canvas, text, (px + 32, y_top + 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
             self.box_list_rects.append((y_top, y_bot, i))
 
     def draw_class_panel(self, canvas):
@@ -736,66 +754,69 @@ class Reviewer:
         cv2.rectangle(overlay, (px, py), (px + panel_w, py + panel_h), (20, 20, 20), -1)
         cv2.addWeighted(overlay, 0.92, canvas, 0.08, 0, canvas)
         cv2.rectangle(canvas, (px, py), (px + panel_w, py + panel_h), (0, 255, 0), 2)
-        cv2.putText(canvas, "SINIF SEC:", (px + 10, py + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        cv2.putText(canvas, "PICK CLASS:", (px + 10, py + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
         for i, (cid, cname) in enumerate(sorted(self.CLASSES.items())):
             ypos = py + 45 + i * 22
             color = CLASS_COLORS.get(cid, name_color(cname))
             key = str(cid) if cid < 10 else ("1+" + str(cid - 10) if cid < 20 else "2+0")
             line = key + " : " + cname
             cv2.putText(canvas, line, (px + 12, ypos),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
     def draw_help(self, canvas):
         overlay = canvas.copy()
         cv2.rectangle(overlay, (50, 50), (DISPLAY_W - 50, DISPLAY_H - 50), (20, 20, 20), -1)
         cv2.addWeighted(overlay, 0.92, canvas, 0.08, 0, canvas)
         lines = [
-            "KONTROLLER",
+            "CONTROLS",
             "",
-            "D / SAG OK         : Sonraki frame",
-            "A / SOL OK         : Onceki frame",
-            "SPACE              : Onayla + sonraki",
-            "T                  : TRASH (gorsel + tum CSV satirlari)",
-            "Click              : Box sec (gorselden veya sag panelden)",
-            "TAB                : Box secim dongusu",
-            "X                  : Secili box'i sil",
-            "R                  : Frame'in tum box'larini sil",
-            "N                  : Yeni box CIZ modu (drag)",
-            "E                  : Secili box EDIT (handles)",
-            "C                  : Secili box sinif degistir",
-            "F                  : Onaylanmamis frame'e atla",
-            "U                  : Uydu/aerial isareti toggle (is_satellite)",
-            "Z                  : Son trash'i geri al",
-            "S / Q              : Kaydet / Kaydet ve cik",
-            "ESC                : Edit/Ciz/Sinif iptal",
+            "D / Right Arrow    : next frame",
+            "A / Left Arrow     : previous frame",
+            "SPACE              : mark reviewed + next",
+            "T                  : TRASH frame (image + all CSV rows)",
+            "Click              : select box (image or right-side panel)",
+            "TAB                : cycle box selection",
+            "X                  : delete selected box",
+            "R                  : remove every box in this frame",
+            "N                  : draw new box (mouse drag)",
+            "E                  : edit selected box (corners / edges)",
+            "C                  : change class of selected box",
+            "F                  : jump to next unreviewed frame",
+            "U                  : toggle is_satellite flag",
+            "Z                  : undo last trash",
+            "S / Q              : save / save and quit",
+            "ESC                : cancel edit / draw / class-pick mode",
             "",
-            "Box ciz/sinif degistir sonrasi:",
-            "  0-9 direkt | 1+0-9 = 10-19 | 2+0 = 20",
+            "After draw or class change:",
+            "  0-9 direct | 1+0-9 = 10-19 | 2+0 = 20",
             "",
-            "Auto-save: her " + str(AUTOSAVE_EVERY) + " trash'te bir CSV'ye yazilir.",
+            "Auto-save: every " + str(AUTOSAVE_EVERY) + " trashes the CSV is flushed.",
         ]
         for i, line in enumerate(lines):
             color = (0, 255, 255) if i == 0 else (220, 220, 220)
             cv2.putText(canvas, line, (80, 90 + i * 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
     # ---------- main loop ----------
     def run(self):
-        wname = "_merged review"
+        wname = "vision-label-curator"
         cv2.namedWindow(wname, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(wname, DISPLAY_W, DISPLAY_H)
         cv2.setMouseCallback(wname, self.mouse_cb)
 
         while True:
             if len(self.frames) == 0:
-                print("Hic frame kalmadi"); break
-            cv2.imshow(wname, self.render())
-            key = cv2.waitKey(30) & 0xFF
+                print("No frames left"); break
+            if self.dirty:
+                cv2.imshow(wname, self.render())
+                self.dirty = False
+            key = cv2.waitKey(15) & 0xFF
             if key == 255:
                 continue
+            self.dirty = True
 
-            # Sinif secim modu
+            # Class-pick mode
             if self.class_select_mode:
                 if key == 27:
                     self.cancel_pending()
@@ -839,18 +860,18 @@ class Reviewer:
                     self.edit_mode = not self.edit_mode
                     if self.edit_mode:
                         self.draw_mode = False
-                        print("Edit ACIK")
+                        print("Edit ON")
                     else:
-                        print("Edit KAPALI"); self.edit_dragging = False
+                        print("Edit OFF"); self.edit_dragging = False
                 else:
-                    print("  Once box sec")
+                    print("  Select a box first")
             elif key == ord('n'):
                 self.draw_mode = not self.draw_mode
                 self.edit_mode = False
                 if self.draw_mode:
-                    print("Cizim ACIK")
+                    print("Draw ON")
                 else:
-                    print("Cizim KAPALI")
+                    print("Draw OFF")
                     self.drawing = False
                     self.draw_start = None
                     self.draw_end = None
@@ -867,16 +888,16 @@ class Reviewer:
             elif key == 27:
                 if self.edit_mode:
                     self.edit_mode = False; self.edit_dragging = False
-                    print("Edit KAPALI")
+                    print("Edit OFF")
                 elif self.draw_mode:
                     self.draw_mode = False; self.drawing = False
                     self.draw_start = None; self.draw_end = None
-                    print("Cizim KAPALI")
+                    print("Draw OFF")
                 else:
                     self.show_help_overlay = False
 
         cv2.destroyAllWindows()
-        print("\nOturum: Pass=" + str(self.session_passed) +
+        print("\nSession: Pass=" + str(self.session_passed) +
               " Trash=" + str(self.session_trashed))
 
 

@@ -23,7 +23,7 @@ def imread_unicode(path):
 
 
 # ============================================================
-# vision-label-curator — bbox review & curation tool
+# data-cleaner-cv — bbox review & curation tool
 # ============================================================
 # Expected CSV columns: new_filename, class_name, cx, cy, w, h
 # (boxes in YOLO-normalized cxcywh in [0, 1]).
@@ -396,7 +396,7 @@ def load_labels(labels_path, images_dir):
 def parse_args(argv):
     import argparse
     p = argparse.ArgumentParser(
-        prog="vision-label-curator",
+        prog="data-cleaner-cv",
         description="Review, clean, and edit object-detection datasets.")
     p.add_argument("--images", help="Directory containing image files.")
     p.add_argument("--labels", help="Path to labels: .csv, .json (COCO), folder of .txt (YOLO), or folder of .xml (VOC).")
@@ -418,7 +418,7 @@ def _prompt(prompt_text, default=None):
 def run_wizard():
     """Interactive prompts when CLI args are missing."""
     print("")
-    print("=== vision-label-curator: first-run setup ===")
+    print("=== data-cleaner-cv: first-run setup ===")
     print("(answers are remembered in the workspace; you can also pass them as CLI args)")
     images = ""
     while not images or not os.path.isdir(images):
@@ -1354,7 +1354,7 @@ class Reviewer:
 
     # ---------- main loop ----------
     def run(self):
-        wname = "vision-label-curator"
+        wname = "data-cleaner-cv"
         cv2.namedWindow(wname, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(wname, DISPLAY_W, DISPLAY_H)
         cv2.setMouseCallback(wname, self.mouse_cb)

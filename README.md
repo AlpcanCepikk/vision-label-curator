@@ -1,13 +1,23 @@
-# vision-label-curator
+# data-cleaner-cv
 
 A keyboard-driven desktop tool for **reviewing, cleaning, editing, and organizing
-object-detection datasets** that combine images with a CSV of bounding-box
-labels. It is designed for human-in-the-loop curation of large datasets
-(hundreds of thousands of rows), not for autonomous cleaning.
+object-detection datasets** that combine images with bounding-box labels. It is
+designed for human-in-the-loop curation of large datasets (hundreds of thousands
+of rows), not for autonomous cleaning.
 
-> **Status:** working in-house tool — currently being generalized for public use.
-> The first public release will add automatic schema detection, full English
-> UI, and a guided first-run setup. See the [Roadmap](#roadmap) below.
+> **Status:** working tool. CLI args, an interactive first-run wizard, automatic
+> schema detection (CSV / YOLO / COCO / Pascal VOC), and a full English UI are
+> all in place. See the [Roadmap](#roadmap) for what is still planned.
+
+![Review window with bounding boxes and box-list panel](docs/screenshot-review.png)
+
+*Reviewing an infrared drone frame: bounding boxes drawn on the image, the
+right-side box list panel, and the live info bar (frame index, counts, status).*
+
+![Thumbnail strip showing neighbouring frames](docs/screenshot-thumbnails.png)
+
+*Thumbnail strip enabled (`[`): 5 previous + current + 5 next frames previewed
+along the bottom for fast navigation.*
 
 ---
 
@@ -81,8 +91,8 @@ The tool currently expects a CSV with at least these columns:
 ### 2. Clone the repo
 
 ```bash
-git clone https://github.com/AlpcanCepikk/vision-label-curator.git
-cd vision-label-curator
+git clone https://github.com/AlpcanCepikk/data-cleaner-cv.git
+cd data-cleaner-cv
 ```
 
 (If you don't have git, you can also download the ZIP from the GitHub page
@@ -110,41 +120,44 @@ pip install -r requirements.txt
 
 This installs `opencv-python`, `numpy`, and `pandas`.
 
-### 5. Place your dataset next to `review.py`
-
-Until the upcoming CLI-args refactor (see roadmap), the tool resolves
-`images/` and `labels.csv` **relative to its own location**. The simplest
-setup is to copy `review.py` (and optionally `workspace_config.example.json`)
-into your dataset folder:
-
-```
-your_workspace/
-├── images/              # your images
-├── labels.csv           # your label rows
-└── review.py            # copied from this repo
-```
-
-Alternatively, you can leave `review.py` where it is and run it with the
-working directory set to your dataset folder — but the **`images/` and
-`labels.csv` paths are read relative to `review.py`'s own folder**, so
-running it from elsewhere will not work yet.
-
-### 6. (Optional) Pre-define your class list
+### 5. (Optional) Pre-define your class list
 
 If you already know the class set you want, copy
-`workspace_config.example.json` to `workspace_config.json` next to
-`review.py` and edit the `classes` map. Otherwise the tool will build one
-automatically from the most-frequent labels in your CSV on first run.
+`workspace_config.example.json` to `workspace_config.json` inside your
+workspace folder and edit the `classes` map. Otherwise the tool builds one
+automatically from the most-frequent labels in your dataset on first run.
 
 ## Run
 
+Point the tool at your images folder and your labels:
+
 ```bash
-python review.py
+python review.py --images /path/to/images --labels /path/to/labels
 ```
 
-A native window opens with the first frame; press `H` any time for an
-in-app help overlay. Press `Q` to save and exit — the next run resumes from
-the same frame index.
+`--labels` accepts any of:
+
+- a `.csv` file,
+- a `.json` COCO file,
+- a folder of YOLO `.txt` files,
+- a folder of Pascal VOC `.xml` files.
+
+The format is auto-detected and normalized into a working `labels.csv` inside
+the workspace (`--workspace DIR`, defaults to the labels' directory). If you
+run `python review.py` with no arguments, an interactive wizard asks for the
+paths; if `images/` and `labels.csv` happen to sit next to `review.py`, those
+are used automatically.
+
+A native window opens with the first frame; press `H` any time for an in-app
+help overlay. Press `Q` to save and exit — the next run resumes from the same
+frame index.
+
+### Export
+
+```bash
+python review.py --images <dir> --labels <workspace>/labels.csv --export-yolo out_dir
+python review.py --images <dir> --labels <workspace>/labels.csv --export-coco out.json
+```
 
 ---
 
@@ -202,18 +215,23 @@ A typical first session looks like this:
 | `T`                | trash frame (image → `_Trash/`, rows → dropped)         |
 | `Z`                | undo last trash                                         |
 | `Click`            | select box (on image or right-side list panel)          |
+| `Shift+Click`      | add / remove box from a multi-selection                 |
 | `TAB`              | cycle box selection                                     |
-| `X`                | delete selected box                                     |
+| `X`                | delete selected box (or the whole multi-selection)      |
 | `R`                | remove every box in this frame                          |
 | `N`                | draw new box (drag, then pick class)                    |
 | `E`                | edit selected box (drag corners / edges / move)         |
 | `C`                | change class of selected box                            |
 | `F`                | jump to next unreviewed frame                           |
 | `U`                | toggle `is_satellite` flag for current frame            |
+| `V` / `Shift+V`    | validate CSV (report only / drop bad rows)              |
+| `P`                | toggle statistics overlay                               |
+| `/`                | cycle class filter (box-list panel only)                |
+| `[`                | toggle thumbnail strip                                  |
 | `S`                | save CSV                                                |
 | `Q`                | save and quit                                           |
 | `H`                | show in-app help overlay                                |
-| `ESC`              | cancel edit / draw / class-pick mode                    |
+| `ESC`              | cancel edit / draw / class-pick mode, close overlays    |
 
 When a class is being assigned (after drawing a new box or after pressing `C`):
 type the class id with the digits `0–9`; for ids `10–19` press `1` then a
@@ -221,31 +239,34 @@ digit; for id `20` press `2` then `0`.
 
 ---
 
-## Auto-save
+## Auto-save & backups
 
-The tool calls auto-save every **50** trashes by default (`AUTOSAVE_EVERY`
-constant in `review.py`). This avoids rewriting a million-row CSV on every
-keystroke while still being durable against crashes. You can also force a save
-with `S` or `Q`.
+The tool auto-saves every **50** trashes by default (`--autosave N` to change).
+This avoids rewriting a million-row CSV on every keystroke while staying durable
+against crashes. You can also force a save with `S` or `Q`. Every save writes a
+timestamped backup into `workspace/_backups/`, keeping the most recent 3.
 
 ---
 
 ## Roadmap
 
-The current `review.py` reflects how the tool is used internally on a single
-large dataset. To make it a clean public tool, the following work is planned:
+Done:
 
-- [ ] **English-only UI** (current build has some Turkish strings).
-- [ ] **CLI args**: `python review.py --images <dir> --labels <csv>` instead of
-      hard-coded relative paths.
-- [ ] **First-run setup wizard** that detects the schema automatically:
-      Pascal VOC XML, YOLO `.txt`, COCO JSON, or generic CSV — and proposes a
-      column mapping.
+- [x] **English-only UI.**
+- [x] **CLI args**: `python review.py --images <dir> --labels <path>`.
+- [x] **First-run setup wizard** with automatic schema detection
+      (CSV, YOLO `.txt` folder, COCO JSON, Pascal VOC XML).
+- [x] **Export** to YOLO `.txt` and COCO JSON (`--export-yolo`, `--export-coco`).
+- [x] **Thumbnail strip** showing nearby frames (`[`).
+- [x] **Statistics overlay** (`P`), **CSV validator** (`V`), **rotating backups**.
+
+Still planned:
+
 - [ ] **Universal class discovery**: on `N` (draw new box) and `C` (change
-      class), classes are pulled from the live CSV *plus* user-defined ones,
-      so any dataset works out of the box.
-- [ ] Export back to YOLO `.txt` / COCO JSON / Pascal VOC.
-- [ ] Optional thumbnail strip showing nearby frames.
+      class), pull classes from the live CSV *plus* user-defined ones.
+- [ ] Export back to Pascal VOC.
+- [ ] Bounding-box snapping and keyboard nudging in edit mode.
+- [ ] Tk/PyQt rewrite for a proper menu bar and file pickers.
 
 If you have a wishlist item, open an issue.
 

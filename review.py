@@ -22,6 +22,32 @@ def imread_unicode(path):
         return None
 
 
+def imwrite_unicode(path, img):
+    """Unicode-safe image write at maximum quality (lossless where possible).
+    Returns True on success."""
+    try:
+        ext = os.path.splitext(path)[1]
+        if not ext:
+            ext = ".png"
+        low = ext.lower()
+        if low in (".jpg", ".jpeg"):
+            params = [cv2.IMWRITE_JPEG_QUALITY, 100]
+        elif low == ".png":
+            params = [cv2.IMWRITE_PNG_COMPRESSION, 1]
+        elif low in (".webp",):
+            params = [cv2.IMWRITE_WEBP_QUALITY, 100]
+        else:
+            params = []
+        ok, buf = cv2.imencode(ext, img, params)
+        if not ok:
+            return False
+        buf.tofile(path)
+        return True
+    except Exception as e:
+        print("  Image write error: " + str(e))
+        return False
+
+
 # ============================================================
 # data-cleaner-cv — bbox review & curation tool
 # ============================================================
@@ -34,12 +60,14 @@ def imread_unicode(path):
 #   A / Left Arrow      : previous frame
 #   SPACE               : mark reviewed + next
 #   T                   : trash frame (image + all CSV rows)
+#   Shift+T              : trash next N frames (type a count)
 #   Click               : select box (image or right-side list panel)
 #   X                   : delete selected box
 #   R                   : remove every box in this frame
 #   N                   : draw new box (mouse drag)
 #   E                   : edit selected box (corners / edges / move)
 #   C                   : change class of selected box
+#   K                   : crop region (drag, ENTER apply, ESC cancel)
 #   TAB                 : cycle box selection
 #   F                   : jump to next unreviewed frame
 #   U                   : toggle is_satellite flag for this frame
@@ -88,6 +116,7 @@ def _detect_display_size(min_w=1280, min_h=720, max_w=1920, max_h=1080, ratio=0.
 
 
 DISPLAY_W, DISPLAY_H = _detect_display_size()
+MAX_UPSCALE = 2.0  # never enlarge an image past this factor when fitting to window
 
 CLASS_COLORS = {
     0: (0, 255, 0), 1: (255, 200, 0), 2: (0, 100, 255),
@@ -523,6 +552,14 @@ class Reviewer:
         self.show_stats_overlay = False
         self.show_thumbs = False
         self.thumb_cache = {}        # frame_name -> small BGR ndarray
+        self.session_cropped = 0
+        self.batch_trash_mode = False
+        self.batch_trash_digits = ""
+        self.crop_mode = False
+        self.cropping = False
+        self.crop_start = None
+        self.crop_end = None
+        self.pending_crop = None     # (x1,y1,x2,y2) orig pixels, awaiting Enter
 
         # Edit / draw
         self.draw_mode = False
@@ -718,6 +755,32 @@ class Reviewer:
         if self.class_select_mode:
             return
 
+        if self.crop_mode:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.cropping = True
+                self.crop_start = (ox, oy)
+                self.crop_end = (ox, oy)
+                self.pending_crop = None
+                self.dirty = True
+            elif event == cv2.EVENT_MOUSEMOVE and self.cropping:
+                self.crop_end = (ox, oy)
+                self.dirty = True
+            elif event == cv2.EVENT_LBUTTONUP and self.cropping:
+                self.cropping = False
+                self.crop_end = (ox, oy)
+                rx1 = min(self.crop_start[0], self.crop_end[0])
+                ry1 = min(self.crop_start[1], self.crop_end[1])
+                rx2 = max(self.crop_start[0], self.crop_end[0])
+                ry2 = max(self.crop_start[1], self.crop_end[1])
+                if (rx2 - rx1) >= 20 and (ry2 - ry1) >= 20:
+                    self.pending_crop = (rx1, ry1, rx2, ry2)
+                else:
+                    self.pending_crop = None
+                    self.crop_start = None
+                    self.crop_end = None
+                self.dirty = True
+            return
+
         if self.edit_mode and self.selected_box >= 0:
             idx = self.df_index_of_selected()
             if idx is None:
@@ -860,6 +923,129 @@ class Reviewer:
             print("  Satellite cleared: " + frame)
         self.unsaved = True
 
+    def apply_crop(self):
+        """Crop the current image to self.pending_crop, overwrite it on disk,
+        re-normalize / clip / drop boxes, and push an undo entry."""
+        if self.pending_crop is None or len(self.frames) == 0:
+            return
+        frame = self.frames[self.current_idx]
+        orig_path = os.path.join(self.paths.images_dir, frame)
+        img = imread_unicode(orig_path)
+        if img is None:
+            print("  Crop: image could not be read"); self.cancel_crop(); return
+        ih, iw = img.shape[:2]
+        cx1, cy1, cx2, cy2 = self.pending_crop
+        cx1 = max(0, min(iw, int(cx1))); cx2 = max(0, min(iw, int(cx2)))
+        cy1 = max(0, min(ih, int(cy1))); cy2 = max(0, min(ih, int(cy2)))
+        if cx1 > cx2: cx1, cx2 = cx2, cx1
+        if cy1 > cy2: cy1, cy2 = cy2, cy1
+        nw, nh = cx2 - cx1, cy2 - cy1
+        if nw < 20 or nh < 20:
+            print("  Crop region too small (<20px)"); self.cancel_crop(); return
+
+        # Backup the original for undo
+        backup_dir = os.path.join(self.paths.workspace, "_originals")
+        os.makedirs(backup_dir, exist_ok=True)
+        backup_path = os.path.join(backup_dir, frame)
+        try:
+            shutil.copy2(orig_path, backup_path)
+        except Exception as e:
+            print("  Crop: backup failed: " + str(e)); self.cancel_crop(); return
+
+        # Write the cropped image over the original
+        cropped = img[cy1:cy2, cx1:cx2].copy()
+        if not imwrite_unicode(orig_path, cropped):
+            print("  Crop: write failed, aborting")
+            self.cancel_crop(); return
+
+        # Re-normalize / clip / drop boxes
+        mask = self.df["new_filename"] == frame
+        saved_rows = self.df[mask].copy()
+        kept_idx = []
+        dropped = 0
+        for idx in self.df[mask].index.tolist():
+            try:
+                bcx = float(self.df.at[idx, "cx"]); bcy = float(self.df.at[idx, "cy"])
+                bw = float(self.df.at[idx, "w"]); bh = float(self.df.at[idx, "h"])
+            except Exception:
+                self.df = self.df.drop(idx); dropped += 1; continue
+            if any(pd.isna(v) for v in (bcx, bcy, bw, bh)):
+                self.df = self.df.drop(idx); dropped += 1; continue
+            bx1, by1, bx2, by2 = self.yolo_to_pixel(bcx, bcy, bw, bh, iw, ih)
+            ix1 = max(bx1, cx1); iy1 = max(by1, cy1)
+            ix2 = min(bx2, cx2); iy2 = min(by2, cy2)
+            orig_area = max(0.0, (bx2 - bx1)) * max(0.0, (by2 - by1))
+            inter_area = max(0.0, (ix2 - ix1)) * max(0.0, (iy2 - iy1))
+            if orig_area <= 0 or inter_area <= 0 or (inter_area / orig_area) < 0.30:
+                self.df = self.df.drop(idx); dropped += 1; continue
+            new = self.pixel_to_yolo(ix1 - cx1, iy1 - cy1, ix2 - cx1, iy2 - cy1, nw, nh)
+            if new is None:
+                self.df = self.df.drop(idx); dropped += 1; continue
+            ncx, ncy, nnw, nnh = new
+            self.df.at[idx, "cx"] = round(ncx, 6)
+            self.df.at[idx, "cy"] = round(ncy, 6)
+            self.df.at[idx, "w"] = round(nnw, 6)
+            self.df.at[idx, "h"] = round(nnh, 6)
+            if "img_width" in self.df.columns:
+                self.df.at[idx, "img_width"] = nw
+            if "img_height" in self.df.columns:
+                self.df.at[idx, "img_height"] = nh
+            kept_idx.append(idx)
+        self.df = self.df.reset_index(drop=True)
+
+        self.undo_stack.append(("crop", frame, backup_path, orig_path, saved_rows))
+        self.thumb_cache.pop(frame, None)
+        self.session_cropped += 1
+        self.unsaved = True
+        self.selected_box = -1
+        self.selected_boxes = set()
+        self.cancel_crop()
+        print("  CROP: " + frame + " -> " + str(nw) + "x" + str(nh) +
+              " | kept " + str(len(kept_idx)) + ", dropped " + str(dropped))
+
+    def batch_trash(self, n):
+        """Trash the current frame plus the next n-1 frames, as one undo unit."""
+        n = max(1, n)
+        items = []
+        for _ in range(n):
+            if not self.frames or self.current_idx >= len(self.frames):
+                break
+            frame = self.frames[self.current_idx]
+            path = os.path.join(self.paths.images_dir, frame)
+            trash_path = os.path.join(self.paths.trash_dir, frame)
+            mask = self.df["new_filename"] == frame
+            saved_rows = self.df[mask].copy()
+            self.df = self.df[~mask].reset_index(drop=True)
+            if os.path.exists(path):
+                try:
+                    shutil.move(path, trash_path)
+                except Exception as e:
+                    print("  Move error: " + str(e))
+                    self.df = pd.concat([self.df, saved_rows], ignore_index=True)
+                    break
+            items.append((frame, trash_path, path, saved_rows))
+            self.frames.pop(self.current_idx)
+        if self.current_idx >= len(self.frames):
+            self.current_idx = max(0, len(self.frames) - 1)
+        if items:
+            self.undo_stack.append(("trash_batch", items, self.current_idx))
+            self.unsaved = True
+            self.selected_box = -1
+            self.selected_boxes = set()
+            self.session_trashed += len(items)
+            self.trash_since_save += len(items)
+            print("  TRASH BATCH: " + str(len(items)) + " frames")
+            if self.trash_since_save >= self.autosave_every:
+                print("  [auto-save]")
+                self.save_csv()
+
+    def cancel_crop(self):
+        self.crop_mode = False
+        self.cropping = False
+        self.crop_start = None
+        self.crop_end = None
+        self.pending_crop = None
+
     def trash_frame(self):
         if len(self.frames) == 0:
             return
@@ -876,7 +1062,7 @@ class Reviewer:
                 print("  Move error: " + str(e))
                 self.df = pd.concat([self.df, saved_rows], ignore_index=True)
                 return
-        self.undo_stack.append((frame, trash_path, path, saved_rows, self.current_idx))
+        self.undo_stack.append(("trash", frame, trash_path, path, saved_rows, self.current_idx))
         self.frames.pop(self.current_idx)
         if self.current_idx >= len(self.frames):
             self.current_idx = max(0, len(self.frames) - 1)
@@ -892,18 +1078,55 @@ class Reviewer:
     def undo(self):
         if not self.undo_stack:
             print("  Nothing to undo"); return
-        frame, trash_path, orig_path, saved_rows, _ = self.undo_stack.pop()
-        if os.path.exists(trash_path):
-            try:
-                shutil.move(trash_path, orig_path)
-            except Exception as e:
-                print("  Undo error: " + str(e)); return
-        self.df = pd.concat([self.df, saved_rows], ignore_index=True)
-        self.frames.append(frame); self.frames.sort()
-        self.current_idx = self.frames.index(frame)
-        self.unsaved = True
-        self.session_trashed = max(0, self.session_trashed - 1)
-        print("  UNDO: " + frame)
+        entry = self.undo_stack.pop()
+        kind = entry[0]
+        if kind == "trash":
+            _, frame, trash_path, orig_path, saved_rows, _ = entry
+            if os.path.exists(trash_path):
+                try:
+                    shutil.move(trash_path, orig_path)
+                except Exception as e:
+                    print("  Undo error: " + str(e)); return
+            self.df = pd.concat([self.df, saved_rows], ignore_index=True)
+            self.frames.append(frame); self.frames.sort()
+            self.current_idx = self.frames.index(frame)
+            self.unsaved = True
+            self.session_trashed = max(0, self.session_trashed - 1)
+            print("  UNDO trash: " + frame)
+        elif kind == "trash_batch":
+            _, items, _ = entry
+            restored = 0
+            for frame, trash_path, orig_path, saved_rows in items:
+                if os.path.exists(trash_path):
+                    try:
+                        shutil.move(trash_path, orig_path)
+                    except Exception as e:
+                        print("  Undo error: " + str(e)); continue
+                self.df = pd.concat([self.df, saved_rows], ignore_index=True)
+                self.frames.append(frame)
+                restored += 1
+            self.frames.sort()
+            if items and items[0][0] in self.frames:
+                self.current_idx = self.frames.index(items[0][0])
+            self.unsaved = True
+            self.session_trashed = max(0, self.session_trashed - restored)
+            print("  UNDO trash batch: " + str(restored) + " frames")
+        elif kind == "crop":
+            _, frame, backup_path, orig_path, saved_rows = entry
+            if os.path.exists(backup_path):
+                try:
+                    shutil.move(backup_path, orig_path)
+                except Exception as e:
+                    print("  Undo error: " + str(e)); return
+            mask = self.df["new_filename"] == frame
+            self.df = self.df[~mask].reset_index(drop=True)
+            self.df = pd.concat([self.df, saved_rows], ignore_index=True).reset_index(drop=True)
+            if frame in self.frames:
+                self.current_idx = self.frames.index(frame)
+            self.thumb_cache.pop(frame, None)
+            self.unsaved = True
+            self.session_cropped = max(0, self.session_cropped - 1)
+            print("  UNDO crop: " + frame)
 
     def delete_selected_box(self):
         # If multi-selection has more than one entry, delete all of them.
@@ -1083,13 +1306,29 @@ class Reviewer:
         if self.pending_box:
             bx1, by1, bx2, by2 = self.pending_box
             cv2.rectangle(img, (int(bx1), int(by1)), (int(bx2), int(by2)), (0, 255, 0), 3)
+        if self.crop_mode and self.cropping and self.crop_start and self.crop_end:
+            cv2.rectangle(img, self.crop_start, self.crop_end, (255, 0, 255), 2)
+        if self.pending_crop:
+            rx1, ry1, rx2, ry2 = [int(v) for v in self.pending_crop]
+            # dim the area outside the crop region
+            shade = img.copy()
+            cv2.rectangle(shade, (0, 0), (img.shape[1], img.shape[0]), (0, 0, 0), -1)
+            cv2.rectangle(shade, (rx1, ry1), (rx2, ry2), (255, 255, 255), -1)
+            mask3 = (shade == 0)
+            img[mask3] = (img[mask3] * 0.45).astype(img.dtype)
+            cv2.rectangle(img, (rx1, ry1), (rx2, ry2), (255, 0, 255), 3)
 
         sx = DISPLAY_W / max(1, self.orig_w)
         sy = DISPLAY_H / max(1, self.orig_h)
-        scale = min(sx, sy)
+        # Fit to window, but never upscale past MAX_UPSCALE -> avoids the
+        # blurry over-zoom of small images / crops.
+        scale = min(sx, sy, MAX_UPSCALE)
         self.scale = scale
         new_w = int(self.orig_w * scale); new_h = int(self.orig_h * scale)
-        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        if scale < 1.0:
+            interp = cv2.INTER_AREA
+        else:
+            interp = cv2.INTER_LANCZOS4
         disp = cv2.resize(img, (new_w, new_h), interpolation=interp)
         canvas = np.zeros((DISPLAY_H, DISPLAY_W, 3), dtype="uint8")
         self.x_offset = (DISPLAY_W - new_w) // 2
@@ -1116,7 +1355,11 @@ class Reviewer:
 
         # Mode bar
         cv2.rectangle(canvas, (0, DISPLAY_H - 30), (DISPLAY_W, DISPLAY_H), (30, 30, 30), -1)
-        if self.class_select_mode:
+        if self.batch_trash_mode:
+            mode = ("TRASH NEXT N: type a count = " +
+                    (self.batch_trash_digits or "_") +
+                    "   ENTER=trash, ESC=cancel")
+        elif self.class_select_mode:
             mode = "PICK CLASS: 0-9 direct, 1+0-9=10-19, 2+0=20, ESC=cancel"
             if self.first_digit is not None:
                 mode = str(self.first_digit) + "_  second digit or ESC"
@@ -1124,8 +1367,13 @@ class Reviewer:
             mode = "EDIT MODE: drag corners/edges, center=move, ESC=exit"
         elif self.draw_mode:
             mode = "DRAW MODE: mouse drag, ESC=exit"
+        elif self.crop_mode:
+            if self.pending_crop:
+                mode = "CROP MODE: ENTER=apply crop, ESC=cancel"
+            else:
+                mode = "CROP MODE: drag a region, then ENTER to apply, ESC=exit"
         else:
-            mode = "D:next A:prev SPACE:review T:trash N:draw E:edit C:class TAB:cycle X:del R:clear F:unreviewed U:sat V:validate Z:undo S:save Q:quit H:help"
+            mode = "D:next A:prev SPACE:review T:trash N:draw E:edit C:class K:crop TAB:cycle X:del R:clear F:unreviewed U:sat V:validate Z:undo S:save Q:quit H:help"
         cv2.putText(canvas, mode, (10, DISPLAY_H - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
 
@@ -1284,6 +1532,7 @@ class Reviewer:
             "Satellite frames   : " + str(sat_frames),
             "Session pass       : " + str(self.session_passed),
             "Session trash      : " + str(self.session_trashed),
+            "Session crop       : " + str(self.session_cropped),
             "",
             "Top classes:",
         ]
@@ -1324,6 +1573,7 @@ class Reviewer:
             "A / Left Arrow     : previous frame",
             "SPACE              : mark reviewed + next",
             "T                  : TRASH frame (image + all CSV rows)",
+            "Shift+T            : trash next N frames (type a count)",
             "Click              : select box (image or right-side panel)",
             "TAB                : cycle box selection",
             "X                  : delete selected box",
@@ -1331,6 +1581,7 @@ class Reviewer:
             "N                  : draw new box (mouse drag)",
             "E                  : edit selected box (corners / edges)",
             "C                  : change class of selected box",
+            "K                  : crop region (drag, ENTER apply, ESC cancel)",
             "F                  : jump to next unreviewed frame",
             "U                  : toggle is_satellite flag",
             "V / Shift+V        : validate CSV (report / drop bad rows)",
@@ -1338,9 +1589,9 @@ class Reviewer:
             "/                  : cycle class filter (box list panel only)",
             "Shift+Click        : multi-select boxes (X deletes all)",
             "[                  : toggle thumbnail strip (prev/next preview)",
-            "Z                  : undo last trash",
+            "Z                  : undo last trash or crop",
             "S / Q              : save / save and quit",
-            "ESC                : cancel edit / draw / class-pick mode",
+            "ESC                : cancel edit / draw / crop / class-pick mode",
             "",
             "After draw or class change:",
             "  0-9 direct | 1+0-9 = 10-19 | 2+0 = 20",
@@ -1370,6 +1621,24 @@ class Reviewer:
                 continue
             self.dirty = True
 
+            # Batch-trash count input mode
+            if self.batch_trash_mode:
+                if key == 27:
+                    self.batch_trash_mode = False
+                    self.batch_trash_digits = ""
+                elif key in (13, 10):  # ENTER
+                    n = int(self.batch_trash_digits) if self.batch_trash_digits else 0
+                    self.batch_trash_mode = False
+                    self.batch_trash_digits = ""
+                    if n > 0:
+                        self.batch_trash(n)
+                elif key == 8:  # Backspace
+                    self.batch_trash_digits = self.batch_trash_digits[:-1]
+                elif ord('0') <= key <= ord('9'):
+                    if len(self.batch_trash_digits) < 5:
+                        self.batch_trash_digits += chr(key)
+                continue
+
             # Class-pick mode
             if self.class_select_mode:
                 if key == 27:
@@ -1396,13 +1665,22 @@ class Reviewer:
             elif key in (ord('d'), 83):
                 self.current_idx = min(self.current_idx + 1, len(self.frames) - 1)
                 self.selected_box = -1; self.edit_mode = False
+                self.selected_boxes = set()
+                if self.crop_mode:
+                    self.cancel_crop()
             elif key in (ord('a'), 81):
                 self.current_idx = max(0, self.current_idx - 1)
                 self.selected_box = -1; self.edit_mode = False
+                self.selected_boxes = set()
+                if self.crop_mode:
+                    self.cancel_crop()
             elif key == ord(' '):
                 self.mark_reviewed_and_next()
             elif key == ord('t'):
                 self.trash_frame()
+            elif key == ord('T'):
+                self.batch_trash_mode = True
+                self.batch_trash_digits = ""
             elif key == ord('z'):
                 self.undo()
             elif key == ord('x'):
@@ -1431,6 +1709,18 @@ class Reviewer:
                     self.draw_end = None
             elif key == ord('c'):
                 self.change_selected_class()
+            elif key == ord('k'):
+                self.crop_mode = not self.crop_mode
+                self.edit_mode = False
+                self.draw_mode = False
+                if self.crop_mode:
+                    print("Crop ON")
+                else:
+                    self.cancel_crop()
+                    print("Crop OFF")
+            elif key in (13, 10):  # ENTER
+                if self.crop_mode and self.pending_crop:
+                    self.apply_crop()
             elif key == 9:  # TAB
                 self.cycle_selection()
             elif key == ord('f'):
@@ -1457,13 +1747,17 @@ class Reviewer:
                     self.draw_mode = False; self.drawing = False
                     self.draw_start = None; self.draw_end = None
                     print("Draw OFF")
+                elif self.crop_mode:
+                    self.cancel_crop()
+                    print("Crop OFF")
                 else:
                     self.show_help_overlay = False
                     self.show_stats_overlay = False
 
         cv2.destroyAllWindows()
         print("\nSession: Pass=" + str(self.session_passed) +
-              " Trash=" + str(self.session_trashed))
+              " Trash=" + str(self.session_trashed) +
+              " Crop=" + str(self.session_cropped))
 
 
 def main(argv=None):

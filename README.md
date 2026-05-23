@@ -222,6 +222,7 @@ A typical first session looks like this:
 | `N`                | draw new box (drag, then pick class)                    |
 | `E`                | edit selected box (drag corners / edges / move)         |
 | `C`                | change class of selected box                            |
+| `K`                | crop a region (drag → `ENTER` apply, `ESC` cancel)      |
 | `F`                | jump to next unreviewed frame                           |
 | `U`                | toggle `is_satellite` flag for current frame            |
 | `V` / `Shift+V`    | validate CSV (report only / drop bad rows)              |
@@ -236,6 +237,17 @@ A typical first session looks like this:
 When a class is being assigned (after drawing a new box or after pressing `C`):
 type the class id with the digits `0–9`; for ids `10–19` press `1` then a
 digit; for id `20` press `2` then `0`.
+
+---
+
+## Cropping
+
+Press `K`, drag a region, and press `ENTER` to crop the current image to that
+region. The cropped image overwrites the original on disk (the original is
+backed up under `workspace/_originals/` so `Z` can undo the crop). All boxes
+are re-normalized to the new image size; a box that straddles the crop edge is
+clipped, and dropped entirely if less than 30% of its original area remains
+inside the crop. `ESC` cancels.
 
 ---
 

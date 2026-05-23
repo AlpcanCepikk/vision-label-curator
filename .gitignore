@@ -1,6 +1,8 @@
 # Datasets / user data
 images/
 _Trash/
+_originals/
+_backups/
 labels.csv
 workspace_config.json
 _review_progress.json

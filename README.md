@@ -286,4 +286,8 @@ If you have a wishlist item, open an issue.
 
 ## License
 
-TBD — to be added before the first tagged release.
+This project is licensed under the **GNU General Public License v3.0** —
+see [LICENSE](LICENSE) for the full text and [NOTICE.md](NOTICE.md) for the
+attribution requirements. You may use, modify, and redistribute it under the
+terms of the GPL; redistributions must remain open source under GPL-3.0 and
+must keep the original author and project attribution visible.

@@ -60,7 +60,8 @@ def imwrite_unicode(path, img):
 #   A / Left Arrow      : previous frame
 #   SPACE               : mark reviewed + next
 #   T                   : trash frame (image + all CSV rows)
-#   Shift+T              : trash next N frames (type a count)
+#   Shift+T              : trash next N frames, skipping reviewed ones (type a count)
+#   B                    : trash all unreviewed frames between current and anchor, jump to anchor
 #   Click               : select box (image or right-side list panel)
 #   X                   : delete selected box
 #   R                   : remove every box in this frame
@@ -533,6 +534,18 @@ class Reviewer:
         self.CLASSES = build_classes(self.df, paths.config_path)
         self.NAME_TO_ID = {v: k for k, v in self.CLASSES.items()}
 
+        # Per-frame reviewed cache (filename -> bool), built once and maintained
+        # in-place so the anchor-distance counter does not need a full df scan.
+        print("Building reviewed index...")
+        rev_by_frame = self.df.groupby("new_filename")["reviewed"].all()
+        self.frame_reviewed = {f: bool(v) for f, v in rev_by_frame.items()}
+        for f in self.frames:
+            if f not in self.frame_reviewed:
+                self.frame_reviewed[f] = False
+        self._anchor_idx = None
+        self._anchor_dirty = True
+        self.ANCHOR_MIN_RUN = 5
+
         # State
         self.current_idx = 0
         self.selected_box = -1
@@ -1004,29 +1017,25 @@ class Reviewer:
               " | kept " + str(len(kept_idx)) + ", dropped " + str(dropped))
 
     def batch_trash(self, n):
-        """Trash the current frame plus the next n-1 frames, as one undo unit."""
+        """Examine n frames from current; trash unreviewed, leave reviewed in place."""
         n = max(1, n)
-        items = []
-        for _ in range(n):
-            if not self.frames or self.current_idx >= len(self.frames):
-                break
-            frame = self.frames[self.current_idx]
-            path = os.path.join(self.paths.images_dir, frame)
-            trash_path = os.path.join(self.paths.trash_dir, frame)
-            mask = self.df["new_filename"] == frame
-            saved_rows = self.df[mask].copy()
-            self.df = self.df[~mask].reset_index(drop=True)
-            if os.path.exists(path):
-                try:
-                    shutil.move(path, trash_path)
-                except Exception as e:
-                    print("  Move error: " + str(e))
-                    self.df = pd.concat([self.df, saved_rows], ignore_index=True)
-                    break
-            items.append((frame, trash_path, path, saved_rows))
-            self.frames.pop(self.current_idx)
-        if self.current_idx >= len(self.frames):
-            self.current_idx = max(0, len(self.frames) - 1)
+        start_idx = self.current_idx
+        hi = min(start_idx + n, len(self.frames))
+        targets = []
+        skipped = 0
+        for i in range(start_idx, hi):
+            f = self.frames[i]
+            if self.frame_reviewed.get(f, False):
+                skipped += 1
+            else:
+                targets.append(f)
+        if not targets:
+            print("  Nothing trashed in range of " + str(hi - start_idx) +
+                  " (all reviewed or empty)")
+            self.current_idx = min(start_idx + skipped, max(0, len(self.frames) - 1))
+            return
+        items = self._bulk_trash(targets)
+        self.current_idx = min(start_idx + skipped, max(0, len(self.frames) - 1))
         if items:
             self.undo_stack.append(("trash_batch", items, self.current_idx))
             self.unsaved = True
@@ -1034,7 +1043,8 @@ class Reviewer:
             self.selected_boxes = set()
             self.session_trashed += len(items)
             self.trash_since_save += len(items)
-            print("  TRASH BATCH: " + str(len(items)) + " frames")
+            print("  TRASH BATCH: " + str(len(items)) +
+                  " trashed, " + str(skipped) + " kept (reviewed)")
             if self.trash_since_save >= self.autosave_every:
                 print("  [auto-save]")
                 self.save_csv()
@@ -1064,6 +1074,8 @@ class Reviewer:
                 return
         self.undo_stack.append(("trash", frame, trash_path, path, saved_rows, self.current_idx))
         self.frames.pop(self.current_idx)
+        self.frame_reviewed.pop(frame, None)
+        self._anchor_dirty = True
         if self.current_idx >= len(self.frames):
             self.current_idx = max(0, len(self.frames) - 1)
         self.unsaved = True
@@ -1090,6 +1102,8 @@ class Reviewer:
             self.df = pd.concat([self.df, saved_rows], ignore_index=True)
             self.frames.append(frame); self.frames.sort()
             self.current_idx = self.frames.index(frame)
+            self.frame_reviewed[frame] = bool(saved_rows["reviewed"].all()) if len(saved_rows) else False
+            self._anchor_dirty = True
             self.unsaved = True
             self.session_trashed = max(0, self.session_trashed - 1)
             print("  UNDO trash: " + frame)
@@ -1104,7 +1118,9 @@ class Reviewer:
                         print("  Undo error: " + str(e)); continue
                 self.df = pd.concat([self.df, saved_rows], ignore_index=True)
                 self.frames.append(frame)
+                self.frame_reviewed[frame] = bool(saved_rows["reviewed"].all()) if len(saved_rows) else False
                 restored += 1
+            self._anchor_dirty = True
             self.frames.sort()
             if items and items[0][0] in self.frames:
                 self.current_idx = self.frames.index(items[0][0])
@@ -1186,8 +1202,105 @@ class Reviewer:
                 self.unsaved = True
         if not was_reviewed:
             self.session_passed += 1
+            self.frame_reviewed[frame] = True
+            self._anchor_dirty = True
         self.current_idx = min(self.current_idx + 1, len(self.frames) - 1)
         self.selected_box = -1
+
+    def _compute_anchor(self):
+        """Most recent index i such that frames[i-MIN+1 .. i] are all reviewed.
+        Scans the whole list (cheap with dict lookup), called only when dirty."""
+        n = len(self.frames)
+        min_run = self.ANCHOR_MIN_RUN
+        anchor = None
+        run = 0
+        for i in range(n):
+            if self.frame_reviewed.get(self.frames[i], False):
+                run += 1
+                if run >= min_run:
+                    anchor = i
+            else:
+                run = 0
+        self._anchor_idx = anchor
+        self._anchor_dirty = False
+
+    def _bulk_trash(self, target_frames):
+        """Move files + drop rows + update frames list for a batch of frame names.
+        Returns the list of successfully trashed items (frame, trash_path, orig_path, saved_rows)."""
+        if not target_frames:
+            return []
+        target_set = set(target_frames)
+        # 1) Move files first; only the ones that succeed will be removed from df/frames.
+        moved = []
+        for f in target_frames:
+            path = os.path.join(self.paths.images_dir, f)
+            trash_path = os.path.join(self.paths.trash_dir, f)
+            if not os.path.exists(path):
+                moved.append((f, trash_path, path))
+                continue
+            try:
+                shutil.move(path, trash_path)
+                moved.append((f, trash_path, path))
+            except Exception as e:
+                print("  Move error (" + f + "): " + str(e))
+        moved_set = {f for f, _, _ in moved}
+        if not moved_set:
+            return []
+        # 2) Single df filter for all moved frames at once.
+        mask = self.df["new_filename"].isin(moved_set)
+        moved_rows = self.df[mask]
+        saved_by_frame = {f: g.copy() for f, g in moved_rows.groupby("new_filename")}
+        self.df = self.df[~mask].reset_index(drop=True)
+        # 3) Single rebuild of frames list (avoid O(M) pops in a loop).
+        self.frames = [f for f in self.frames if f not in moved_set]
+        for f in moved_set:
+            self.frame_reviewed.pop(f, None)
+        self._anchor_dirty = True
+        empty = self.df.iloc[0:0]
+        return [(f, tp, op, saved_by_frame.get(f, empty)) for f, tp, op in moved]
+
+    def trash_to_anchor(self):
+        """Trash every unreviewed frame between current and anchor (inclusive).
+        Reviewed (pass'lenmis) frames are kept. After completion, jumps to anchor."""
+        anchor_idx, dist = self.get_anchor_distance()
+        if anchor_idx is None:
+            print("  No anchor yet (need " + str(self.ANCHOR_MIN_RUN) + " consecutive reviewed)")
+            return
+        if dist == 0:
+            print("  Already at anchor")
+            return
+        lo = min(anchor_idx, self.current_idx)
+        hi = min(max(anchor_idx, self.current_idx), len(self.frames) - 1)
+        targets = [self.frames[i] for i in range(lo, hi + 1)
+                   if not self.frame_reviewed.get(self.frames[i], False)]
+        if not targets:
+            print("  No unreviewed frames between current and anchor")
+            return
+        items = self._bulk_trash(targets)
+        if not items:
+            return
+        self._compute_anchor()
+        if self._anchor_idx is not None:
+            self.current_idx = self._anchor_idx
+        elif self.current_idx >= len(self.frames):
+            self.current_idx = max(0, len(self.frames) - 1)
+        self.undo_stack.append(("trash_batch", items, self.current_idx))
+        self.unsaved = True
+        self.selected_box = -1
+        self.selected_boxes = set()
+        self.session_trashed += len(items)
+        self.trash_since_save += len(items)
+        print("  TRASH TO ANCHOR: " + str(len(items)) + " trashed, jumped to anchor")
+        if self.trash_since_save >= self.autosave_every:
+            print("  [auto-save]")
+            self.save_csv()
+
+    def get_anchor_distance(self):
+        if self._anchor_dirty:
+            self._compute_anchor()
+        if self._anchor_idx is None:
+            return None, None
+        return self._anchor_idx, self.current_idx - self._anchor_idx
 
     def change_selected_class(self):
         """Copy selected box into pending, delete it, enter class-select mode."""
@@ -1342,6 +1455,12 @@ class Reviewer:
         is_sat = bool((boxes_df["is_satellite"] == 1).any()) if len(boxes_df) > 0 else False
         status = "REVIEWED" if is_reviewed else "PENDING"
         scol = (0, 255, 0) if is_reviewed else (0, 200, 255)
+        anchor_idx, anchor_dist = self.get_anchor_distance()
+        if anchor_dist is None:
+            anchor_str = "  Anchor:-"
+        else:
+            sign = "+" if anchor_dist > 0 else ("" if anchor_dist == 0 else "")
+            anchor_str = "  Anchor:" + sign + str(anchor_dist)
         info = ("[" + str(self.current_idx + 1) + "/" + str(len(self.frames)) + "] " +
                 frame + "  Box:" + str(len(boxes_df)) +
                 "  Sel:" + (str(self.selected_box + 1) if self.selected_box >= 0 else "-") +
@@ -1350,13 +1469,14 @@ class Reviewer:
                 "  Pass:" + str(self.session_passed) +
                 "  Trash:" + str(self.session_trashed) +
                 "  Sat:" + str(self.session_satellite) +
+                anchor_str +
                 ("  UNSAVED" if self.unsaved else ""))
         cv2.putText(canvas, info, (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.5, scol, 1, cv2.LINE_AA)
 
         # Mode bar
         cv2.rectangle(canvas, (0, DISPLAY_H - 30), (DISPLAY_W, DISPLAY_H), (30, 30, 30), -1)
         if self.batch_trash_mode:
-            mode = ("TRASH NEXT N: type a count = " +
+            mode = ("TRASH NEXT N (skip reviewed): type a count = " +
                     (self.batch_trash_digits or "_") +
                     "   ENTER=trash, ESC=cancel")
         elif self.class_select_mode:
@@ -1573,7 +1693,8 @@ class Reviewer:
             "A / Left Arrow     : previous frame",
             "SPACE              : mark reviewed + next",
             "T                  : TRASH frame (image + all CSV rows)",
-            "Shift+T            : trash next N frames (type a count)",
+            "Shift+T            : trash next N frames, skipping reviewed (type a count)",
+            "B                  : trash unreviewed between current and anchor, jump to anchor",
             "Click              : select box (image or right-side panel)",
             "TAB                : cycle box selection",
             "X                  : delete selected box",
@@ -1639,6 +1760,7 @@ class Reviewer:
                         self.batch_trash_digits += chr(key)
                 continue
 
+
             # Class-pick mode
             if self.class_select_mode:
                 if key == 27:
@@ -1681,6 +1803,8 @@ class Reviewer:
             elif key == ord('T'):
                 self.batch_trash_mode = True
                 self.batch_trash_digits = ""
+            elif key == ord('b'):
+                self.trash_to_anchor()
             elif key == ord('z'):
                 self.undo()
             elif key == ord('x'):

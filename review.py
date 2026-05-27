@@ -1785,13 +1785,27 @@ class Reviewer:
             elif key == ord('s'):
                 self.save_csv()
             elif key in (ord('d'), 83):
-                self.current_idx = min(self.current_idx + 1, len(self.frames) - 1)
+                delta = 1
+                if hasattr(cv2, 'pollKey'):
+                    while True:
+                        nk = cv2.pollKey() & 0xFF
+                        if nk in (ord('d'), 83): delta += 1
+                        elif nk in (ord('a'), 81): delta -= 1
+                        else: break
+                self.current_idx = max(0, min(self.current_idx + delta, len(self.frames) - 1))
                 self.selected_box = -1; self.edit_mode = False
                 self.selected_boxes = set()
                 if self.crop_mode:
                     self.cancel_crop()
             elif key in (ord('a'), 81):
-                self.current_idx = max(0, self.current_idx - 1)
+                delta = -1
+                if hasattr(cv2, 'pollKey'):
+                    while True:
+                        nk = cv2.pollKey() & 0xFF
+                        if nk in (ord('a'), 81): delta -= 1
+                        elif nk in (ord('d'), 83): delta += 1
+                        else: break
+                self.current_idx = max(0, min(self.current_idx + delta, len(self.frames) - 1))
                 self.selected_box = -1; self.edit_mode = False
                 self.selected_boxes = set()
                 if self.crop_mode:
@@ -1800,6 +1814,13 @@ class Reviewer:
                 self.mark_reviewed_and_next()
             elif key == ord('t'):
                 self.trash_frame()
+                if hasattr(cv2, 'pollKey'):
+                    while True:
+                        nk = cv2.pollKey() & 0xFF
+                        if nk == ord('t') and len(self.frames) > 0:
+                            self.trash_frame()
+                        else:
+                            break
             elif key == ord('T'):
                 self.batch_trash_mode = True
                 self.batch_trash_digits = ""
